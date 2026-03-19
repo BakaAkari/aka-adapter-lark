@@ -1,0 +1,74 @@
+{
+  "name": "koishi-plugin-aka-adapter-lark",
+  "version": "0.0.1",
+  "description": "Optimized fork of the official adapter-lark plugin for Koishi.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/BakaAkari/aka-adapter-lark.git"
+  },
+  "homepage": "https://github.com/BakaAkari/aka-adapter-lark#readme",
+  "bugs": {
+    "url": "https://github.com/BakaAkari/aka-adapter-lark/issues"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "peerDependencies": {
+    "koishi": "^4.18.10"
+  },
+  "devDependencies": {
+    "@cordisjs/plugin-server": "^0.2.9",
+    "@satorijs/core": "^4.5.2",
+    "@types/node": "^24.5.2",
+    "koishi": "^4.18.10",
+    "rimraf": "^6.0.1",
+    "tsup": "^8.5.0",
+    "typescript": "^5.9.2"
+  },
+  "dependencies": {
+    "@cordisjs/plugin-server": "^0.2.9",
+    "@satorijs/core": "^4.5.2",
+    "cosmokit": "^1.8.1",
+    "protobufjs": "^8.0.0"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts --sourcemap",
+    "clean": "rimraf dist",
+    "prepublishOnly": "pnpm run clean && pnpm run build",
+    "typecheck": "tsc --project tsconfig.json --noEmit"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "koishi",
+    "koishi-plugin",
+    "adapter",
+    "lark",
+    "feishu",
+    "satori"
+  ],
+  "koishi": {
+    "browser": true,
+    "description": {
+      "en": "Optimized fork of the official Lark / Feishu adapter plugin.",
+      "zh": "对官方 adapter-lark 插件做增强优化的 Lark / 飞书适配器分支。"
+    },
+    "service": {
+      "implements": [
+        "adapter"
+      ]
+    }
+  }
+}
