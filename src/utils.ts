@@ -5,6 +5,51 @@ import { Im, ListChat, Message, User } from './types'
 import { MessageContent } from './content'
 import { hyphenate } from 'cosmokit'
 
+function detectImageMimeType(data: ArrayBuffer): string | undefined {
+  const bytes = new Uint8Array(data)
+  if (bytes.length >= 8
+    && bytes[0] === 0x89
+    && bytes[1] === 0x50
+    && bytes[2] === 0x4E
+    && bytes[3] === 0x47
+    && bytes[4] === 0x0D
+    && bytes[5] === 0x0A
+    && bytes[6] === 0x1A
+    && bytes[7] === 0x0A) {
+    return 'image/png'
+  }
+  if (bytes.length >= 3
+    && bytes[0] === 0xFF
+    && bytes[1] === 0xD8
+    && bytes[2] === 0xFF) {
+    return 'image/jpeg'
+  }
+  if (bytes.length >= 6) {
+    const header = Buffer.from(bytes.subarray(0, 6)).toString('ascii')
+    if (header === 'GIF87a' || header === 'GIF89a') {
+      return 'image/gif'
+    }
+  }
+  if (bytes.length >= 12) {
+    const riff = Buffer.from(bytes.subarray(0, 4)).toString('ascii')
+    const webp = Buffer.from(bytes.subarray(8, 12)).toString('ascii')
+    if (riff === 'RIFF' && webp === 'WEBP') {
+      return 'image/webp'
+    }
+  }
+  if (bytes.length >= 2 && bytes[0] === 0x42 && bytes[1] === 0x4D) {
+    return 'image/bmp'
+  }
+}
+
+export function createImageDataUrl(data: ArrayBuffer): string {
+  const mime = detectImageMimeType(data)
+  if (!mime) {
+    throw new Error('unable to detect image MIME type')
+  }
+  return `data:${mime};base64,${Buffer.from(data).toString('base64')}`
+}
+
 export interface EventHeader<K extends keyof Events> {
   event_id: string
   event_type: K
@@ -15,6 +60,16 @@ export interface EventHeader<K extends keyof Events> {
 }
 
 export interface Events {
+  /**
+   * Bot entered a p2p chat.
+   * Structure inferred from the callback payload and used to hydrate/log the actor.
+   */
+  'im.chat.access_event.bot_p2p_chat_entered_v1': {
+    chat_id: string
+    last_message_create_time?: string
+    last_message_id?: string
+    operator_id: UserIds
+  }
   /**
    * Receive message event.
    * @see https://open.larksuite.com/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/message/events/receive
@@ -205,7 +260,7 @@ export async function adaptMessage<C extends Context = Context>(
       break
     }
     case 'image':
-      content.push(h.image(bot.getResourceUrl('image', data.message.message_id, json.image_key)))
+      content.push(h.image(await bot.getIncomingImageUrl(data.message.message_id, json.image_key)))
       break
     case 'audio':
       content.push(h.audio(bot.getResourceUrl('file', data.message.message_id, json.file_key)))
@@ -241,6 +296,28 @@ export async function adaptSession<C extends Context>(bot: LarkBot<C>, body: Eve
   }
 
   switch (body.type) {
+    case 'im.chat.access_event.bot_p2p_chat_entered_v1':
+      session.type = 'interaction'
+      session.subtype = 'private'
+      session.isDirect = true
+      session.timestamp = +body.header.create_time
+      session.channelId = body.event.chat_id
+      session.guildId = body.event.chat_id
+      adaptSender({
+        sender_id: body.event.operator_id,
+        tenant_key: body.header.tenant_key,
+      }, session)
+      await bot.hydrateSessionUser(session, session.userId, 'open_id')
+      break
+    case 'im.message.message_read_v1':
+      session.type = 'interaction'
+      session.timestamp = +body.event.reader.read_time
+      adaptSender({
+        sender_id: body.event.reader.reader_id,
+        tenant_key: body.event.reader.tenant_key,
+      }, session)
+      await bot.hydrateSessionUser(session, session.userId, 'open_id')
+      break
     case 'im.message.receive_v1':
       session.event.referrer.event.message = pick(body.event.message, ['message_id', 'thread_id'])
       session.type = 'message'
@@ -364,7 +441,7 @@ export async function decodeMessage<C extends Context = Context>(bot: LarkBot<C>
       break
     }
     case 'image':
-      content.push(h.image(bot.getResourceUrl('image', body.message_id!, json.image_key)))
+      content.push(h.image(await bot.getIncomingImageUrl(body.message_id!, json.image_key)))
       break
     case 'audio':
       content.push(h.audio(bot.getResourceUrl('file', body.message_id!, json.file_key)))

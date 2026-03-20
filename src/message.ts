@@ -16,10 +16,11 @@ export class LarkMessageEncoder<C extends Context = Context> extends MessageEnco
 
   public editMessageIds: string[] | undefined
 
-  async post(data?: any) {
+  async post(data?: any, logContent?: string) {
     try {
       let resp: Message
       let quote = this.quote
+      let operation: 'create' | 'reply' | 'edit' = 'create'
       if (!quote && this.referrer) {
         if (this.referrer.type === 'im.message.receive_v1' && this.referrer.event.message.thread_id) {
           quote = {
@@ -38,6 +39,7 @@ export class LarkMessageEncoder<C extends Context = Context> extends MessageEnco
         }
       }
       if (this.editMessageIds) {
+        operation = 'edit'
         const messageId = this.editMessageIds.pop()
         if (!messageId) throw new Error('No message to edit')
         if (data.msg_type === 'interactive') {
@@ -46,18 +48,39 @@ export class LarkMessageEncoder<C extends Context = Context> extends MessageEnco
         } else {
           await this.bot.internal.im.message.update(messageId, data)
         }
+        this.bot.logOutgoingMessage({
+          operation,
+          channelId: this.channelId,
+          messageId,
+          messageType: data?.msg_type,
+          content: logContent,
+          chatKind: this.session.isDirect ? 'direct' : (this.session.channelId || this.session.guildId ? 'group' : 'unknown'),
+        })
+        return
       } else if (quote?.id) {
+        operation = 'reply'
         resp = await this.bot.internal.im.message.reply(quote.id, {
           ...data,
           reply_in_thread: quote.replyInThread,
         })
       } else {
+        operation = 'create'
         data.receive_id = this.channelId
         resp = await this.bot.internal.im.message.create(data, {
           receive_id_type: extractIdType(this.channelId),
         })
       }
       if (!resp) return
+      this.bot.logOutgoingMessage({
+        operation,
+        channelId: this.channelId,
+        messageId: resp.message_id,
+        messageType: data?.msg_type,
+        content: logContent,
+        chatKind: this.session.isDirect ? 'direct' : (this.session.channelId || this.session.guildId ? 'group' : 'unknown'),
+        replyTo: quote?.id,
+        replyInThread: quote?.replyInThread,
+      })
       const session = this.bot.session()
       session.messageId = resp.message_id
       session.timestamp = Number(resp.create_time) * 1000
@@ -85,6 +108,43 @@ export class LarkMessageEncoder<C extends Context = Context> extends MessageEnco
     this.textContent = ''
   }
 
+  private describeRichContent() {
+    const text = this.richContent.flat().map((item) => {
+      if ('text' in item && typeof item.text === 'string') return item.text
+      if (item.tag === 'img') return '[image]'
+      if (item.tag === 'a') return '[link]'
+      if (item.tag === 'hr') return '[divider]'
+      return ''
+    }).join(' ')
+    return text || '[post]'
+  }
+
+  private describeCard(card: MessageContent.Card) {
+    const parts: string[] = []
+    const visit = (value: unknown) => {
+      if (!value) return
+      if (typeof value === 'string') {
+        parts.push(value)
+        return
+      }
+      if (Array.isArray(value)) {
+        value.forEach(visit)
+        return
+      }
+      if (typeof value === 'object') {
+        for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+          if (['content', 'text', 'title', 'subtitle', 'label', 'name', 'value', 'placeholder'].includes(key)) {
+            visit(child)
+          } else if (typeof child === 'object') {
+            visit(child)
+          }
+        }
+      }
+    }
+    visit(card)
+    return parts.join(' ').replace(/\s+/g, ' ').trim() || '[card]'
+  }
+
   async flush() {
     this.flushText()
     if (!this.card && !this.richContent.length) return
@@ -92,11 +152,13 @@ export class LarkMessageEncoder<C extends Context = Context> extends MessageEnco
     if (this.card) {
       // strip undefined properties
       this.bot.logger.debug('card %o', JSON.parse(JSON.stringify(this.card)))
+      const logContent = this.describeCard(this.card)
       await this.post({
         msg_type: 'interactive',
         content: JSON.stringify(this.card),
-      })
+      }, logContent)
     } else {
+      const logContent = this.describeRichContent()
       await this.post({
         msg_type: 'post',
         content: JSON.stringify({
@@ -104,7 +166,7 @@ export class LarkMessageEncoder<C extends Context = Context> extends MessageEnco
             content: this.richContent,
           },
         }),
-      })
+      }, logContent)
     }
 
     // reset cached content
@@ -131,7 +193,7 @@ export class LarkMessageEncoder<C extends Context = Context> extends MessageEnco
       await this.post({
         msg_type: _type === 'video' ? 'media' : _type,
         content: JSON.stringify({ file_key }),
-      })
+      }, `[${_type}] ${attrs.title || attrs.fileName || file_key}`)
       return
     }
 
@@ -166,7 +228,7 @@ export class LarkMessageEncoder<C extends Context = Context> extends MessageEnco
     await this.post({
       msg_type: _type === 'video' ? 'media' : _type,
       content: JSON.stringify({ file_key }),
-    })
+    }, `[${_type}] ${filename}`)
   }
 
   private createBehaviors(attrs: Dict) {

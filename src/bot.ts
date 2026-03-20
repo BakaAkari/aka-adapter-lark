@@ -25,6 +25,19 @@ interface CachedHydratedUserProfile {
   profile: HydratedUserProfile | null
 }
 
+type IncomingImageMode = 'internal' | 'data-url'
+
+function formatHydrationError(error: unknown) {
+  if (error instanceof HTTP.Error && error.response?.data) {
+    const data = error.response.data as { code?: number; msg?: string }
+    if (typeof data.code === 'number' || typeof data.msg === 'string') {
+      return `code=${data.code ?? 'unknown'}, msg=${data.msg ?? 'unknown'}`
+    }
+  }
+
+  return String(error)
+}
+
 export class LarkBot<C extends Context = Context, T extends LarkBot.Config = LarkBot.Config> extends Bot<C, T> {
   static inject = ['http']
   static MessageEncoder = LarkMessageEncoder
@@ -35,6 +48,8 @@ export class LarkBot<C extends Context = Context, T extends LarkBot.Config = Lar
   internal: Internal<C>
   private userProfileCache = new Map<string, CachedHydratedUserProfile>()
   private userProfileRequests = new Map<string, Promise<HydratedUserProfile | null>>()
+  private userProfileHydrationWarningEmitted = false
+  private incomingImageUrlCache = new Map<string, string>()
 
   constructor(ctx: C, config: T) {
     super(ctx, config, 'lark')
@@ -70,6 +85,35 @@ export class LarkBot<C extends Context = Context, T extends LarkBot.Config = Lar
 
   getResourceUrl(type: string, message_id: string, file_key: string) {
     return this.getInternalUrl(`/im/v1/messages/${message_id}/resources/${file_key}`, { type })
+  }
+
+  async getIncomingImageUrl(messageId: string, imageKey: string) {
+    const fallbackUrl = this.getResourceUrl('image', messageId, imageKey)
+    if (this.config.incomingImageMode !== 'data-url') {
+      return fallbackUrl
+    }
+
+    const cacheKey = `${messageId}:${imageKey}`
+    const cached = this.incomingImageUrlCache.get(cacheKey)
+    if (cached) {
+      return cached
+    }
+
+    try {
+      const data = await this.internal.im.message.resource.get(messageId, imageKey, { type: 'image' })
+      const dataUrl = Utils.createImageDataUrl(data)
+      this.incomingImageUrlCache.set(cacheKey, dataUrl)
+      return dataUrl
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      this.logger.warn(
+        'failed to inline Lark image resource as data URL, falling back to internal URL: messageId=%s imageKey=%s detail=%s',
+        messageId,
+        imageKey,
+        detail,
+      )
+      return fallbackUrl
+    }
   }
 
   async initialize() {
@@ -171,6 +215,127 @@ export class LarkBot<C extends Context = Context, T extends LarkBot.Config = Lar
     }
   }
 
+  private summarizeText(value: string | undefined, fallback = '[empty]') {
+    const normalized = (value || '').replace(/\s+/g, ' ').trim()
+    return normalized || fallback
+  }
+
+  private getUserLabel(session: Session) {
+    const userId = session.userId || session.event.user?.id || 'unknown'
+    const userName = session.event.member?.name || session.event.user?.name
+    return userName ? `${userName} (${userId})` : userId
+  }
+
+  private getChatKind(session: Session) {
+    if (session.isDirect) return 'direct'
+    if (session.channelId || session.guildId) return 'group'
+    return 'unknown'
+  }
+
+  logIncomingSession(session: Session, body: Utils.EventPayload) {
+    const userLabel = this.getUserLabel(session)
+    const channelId = session.channelId || 'unknown'
+    const chat = this.getChatKind(session)
+    const eventType = body.type as string
+
+    switch (body.type) {
+      case 'im.message.receive_v1': {
+        const content = this.summarizeText(session.content)
+        const quoteId = session.quote?.id || body.event.message.parent_id || '-'
+        const threadId = body.event.message.thread_id || '-'
+        this.logger.info(
+          'inbound kind=message event=%s chat=%s messageType=%s user=%s channel=%s messageId=%s threadId=%s quoteId=%s content=%s',
+          body.type,
+          chat,
+          body.event.message.message_type,
+          userLabel,
+          channelId,
+          body.event.message.message_id,
+          threadId,
+          quoteId,
+          content,
+        )
+        return
+      }
+      case 'im.chat.access_event.bot_p2p_chat_entered_v1':
+        this.logger.info(
+          'inbound kind=event event=%s chat=%s user=%s channel=%s lastMessageId=%s',
+          body.type,
+          chat,
+          userLabel,
+          channelId,
+          body.event.last_message_id || '-',
+        )
+        return
+      case 'im.message.message_read_v1':
+        this.logger.info(
+          'inbound kind=event event=%s user=%s readAt=%s messageIds=%s',
+          body.type,
+          userLabel,
+          body.event.reader.read_time,
+          body.event.message_id_list.join(',') || '-',
+        )
+        return
+      case 'application.bot.menu_v6':
+        this.logger.info(
+          'inbound kind=event event=%s chat=%s user=%s command=%s',
+          body.type,
+          chat,
+          userLabel,
+          body.event.event_key,
+        )
+        return
+      case 'card.action.trigger':
+        this.logger.info(
+          'inbound kind=event event=%s chat=%s user=%s channel=%s actionTag=%s actionValue=%s',
+          body.type,
+          chat,
+          userLabel,
+          body.event.context.open_chat_id || channelId,
+          body.event.action.tag,
+          this.summarizeText(JSON.stringify(body.event.action.value), '[none]'),
+        )
+        return
+      default:
+        this.logger.info(
+          'inbound kind=event event=%s chat=%s user=%s channel=%s',
+          eventType,
+          chat,
+          userLabel,
+          channelId,
+        )
+    }
+  }
+
+  logOutgoingMessage(entry: {
+    operation: 'create' | 'reply' | 'edit'
+    channelId: string
+    messageId?: string
+    messageType?: string
+    content?: string
+    chatKind?: string
+    replyTo?: string
+    replyInThread?: boolean
+  }) {
+    this.logger.info(
+      'outbound kind=message operation=%s chat=%s channel=%s messageType=%s messageId=%s replyTo=%s threadReply=%s content=%s',
+      entry.operation,
+      entry.chatKind || 'unknown',
+      entry.channelId,
+      entry.messageType || 'unknown',
+      entry.messageId || '-',
+      entry.replyTo || '-',
+      entry.replyInThread ? 'yes' : 'no',
+      this.summarizeText(entry.content),
+    )
+  }
+
+  private emitHydrationWarning(detail: string) {
+    if (this.userProfileHydrationWarningEmitted) return
+    this.userProfileHydrationWarningEmitted = true
+    this.logger.warn('failed to hydrate Lark user profiles; incoming logs will fall back to user IDs until contact access is available: %s', detail)
+  }
+
   private async getHydratedUserProfile(userId: string, idType: Utils.UserIdType): Promise<HydratedUserProfile | null> {
     const cacheKey = `${idType}:${userId}`
     const now = Date.now()
@@ -199,13 +364,20 @@ export class LarkBot<C extends Context = Context, T extends LarkBot.Config = Lar
         user_id_type: idType,
       })
       const profile = data.user ? this.decodeHydratedUserProfile(data.user) : null
+      if (!data.user) {
+        this.emitHydrationWarning('empty user profile response')
+      } else if (!profile?.user.name && !profile?.nickname) {
+        this.emitHydrationWarning('user profile response does not contain readable name fields')
+      }
       this.userProfileCache.set(cacheKey, {
         profile,
         expiresAt: Date.now() + this.config.profileCacheTtl * Time.second,
       })
       return profile
     } catch (error) {
-      this.logger.debug('failed to hydrate Lark user profile %s (%s): %s', userId, idType, error)
+      const detail = formatHydrationError(error)
+      this.emitHydrationWarning(detail)
+      this.logger.debug('failed to hydrate Lark user profile %s (%s): %s', userId, idType, detail)
       this.userProfileCache.set(cacheKey, {
         profile: null,
         expiresAt: Date.now() + this.config.profileFailureCacheTtl * Time.second,
@@ -272,6 +444,7 @@ export namespace LarkBot {
     hydrateUserProfile: boolean
     profileCacheTtl: number
     profileFailureCacheTtl: number
+    incomingImageMode: IncomingImageMode
   }
 
   export type Config = BaseConfig & (HttpServer.Options | WsClient.Options)
@@ -284,6 +457,7 @@ export namespace LarkBot {
       hydrateUserProfile: Schema.boolean().default(true).description('收到事件时查询飞书通讯录并补全用户名称、昵称与头像。'),
       profileCacheTtl: Schema.number().min(60).default(3600).description('用户资料成功缓存时长，单位为秒。'),
       profileFailureCacheTtl: Schema.number().min(10).default(300).description('用户资料查询失败缓存时长，单位为秒。'),
+      incomingImageMode: Schema.union(['internal', 'data-url']).default('internal').description('收到图片消息时输出的资源格式。`data-url` 可兼容不支持 `internal:` 协议的插件。'),
       protocol: process.env.KOISHI_ENV === 'browser'
         ? Schema.const('ws').default('ws')
         : Schema.union(['http', 'ws']).description('选择要使用的协议。').default('http'),

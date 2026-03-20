@@ -86,6 +86,7 @@ export class HttpServer<C extends Context = Context> extends Adapter<C, LarkBot<
     body.type = event_type // add type to body to ease typescript type narrowing
     const bot = this.bots.find((bot) => bot.config.appId === app_id)!
     const session = await adaptSession(bot, body)
+    bot.logIncomingSession(session, body)
     bot.dispatch(session)
   }
 

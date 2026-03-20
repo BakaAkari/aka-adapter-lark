@@ -1,7 +1,7 @@
 import { Adapter, Context, Schema, Universal } from '@satorijs/core'
 import { LarkBot } from './bot'
 import { adaptSession, EventPayload } from './utils'
-import pb from 'protobufjs/light'
+import pb from 'protobufjs/light.js'
 
 enum FrameType {
   control = 0,
@@ -129,9 +129,10 @@ export class WsClient<C extends Context = Context> extends Adapter.WsClient<C, L
 
         const body: EventPayload = JSON.parse(Buffer.from(data).toString('utf8'))
         if (!body.header) return
-        this.bot.logger.info('received event: %o', body)
+        this.bot.logger.debug('received event: %o', body)
         body.type = body.header.event_type
         const session = await adaptSession(this.bot, body)
+        this.bot.logIncomingSession(session, body)
         this.bot.dispatch(session)
 
         this.send({

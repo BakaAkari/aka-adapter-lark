@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-aka-adapter-lark",
-  "version": "0.0.1",
+  "version": "0.0.10",
   "description": "Optimized fork of the official adapter-lark plugin for Koishi.",
   "license": "MIT",
   "repository": {
@@ -21,15 +21,15 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
-    }
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
   },
   "peerDependencies": {
     "koishi": "^4.18.10"
   },
   "devDependencies": {
-    "@cordisjs/plugin-server": "^0.2.9",
-    "@satorijs/core": "^4.5.2",
     "@types/node": "^24.5.2",
     "koishi": "^4.18.10",
     "rimraf": "^6.0.1",

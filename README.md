@@ -9,6 +9,7 @@
 - 将用户名写入 `session.username`
 - 将昵称写入 `session.author.nickname`
 - 缓存用户资料，避免每条消息都请求 OpenAPI
+- 可选将入站图片转成 `data:` URL，兼容不支持 `internal:` 资源协议的插件
 
 ## Why
 
@@ -23,8 +24,11 @@
 - `hydrateUserProfile`: 是否在收到事件时补全用户资料，默认 `true`
 - `profileCacheTtl`: 用户资料成功缓存时长，默认 `3600` 秒
 - `profileFailureCacheTtl`: 用户资料查询失败缓存时长，默认 `300` 秒
+- `incomingImageMode`: 入站图片输出格式，默认 `internal`，可设为 `data-url` 以兼容 ChatLuna 这类不支持 `internal:` 协议的插件
 
 要让资料补全生效，你的飞书应用需要具备通讯录用户信息读取权限。
+
+当 `incomingImageMode = data-url` 时，适配器会在收到图片消息后额外调用一次飞书资源接口，下载图片并内嵌为 base64 `data:` URL。这会增加单条图片消息的处理开销，但能直接兼容只能读取常规 URL 或 `data:` URL 的插件。
 
 ## Replace Official Adapter
 
