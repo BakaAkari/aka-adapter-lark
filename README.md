@@ -17,6 +17,16 @@
 
 这个分支的目标是保持上游行为兼容，同时让会话层面能直接拿到用户名和昵称。
 
+当前仓库里的整体分层是：
+
+- `aka-adapter-lark`: 负责飞书事件接入和 Koishi session 质量
+- `aka-lark-center`: 负责飞书 API、权限、资源读取和 LLM / ChatLuna 可用表示
+
+架构说明见：
+
+- [`docs/lark-center-doc/architecture.md`](../../docs/lark-center-doc/architecture.md)
+- [`docs/lark-center-doc/context-injection.md`](../../docs/lark-center-doc/context-injection.md)
+
 ## Config
 
 除了官方 Lark / Feishu adapter 的常规配置外，新增了这些项：
