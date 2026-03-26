@@ -177,12 +177,34 @@ export class LarkMessageEncoder<C extends Context = Context> extends MessageEnco
   }
 
   async createImage(url: string) {
-    const { filename, type, data } = await this.bot.assetsQuester.file(url)
-    const { image_key } = await this.bot.internal.im.image.create({
-      image_type: 'message',
-      image: new File([data], filename, { type }),
-    })
-    return image_key
+    const maxRetries = 2
+    let lastError: unknown
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const { filename, type, data } = await this.bot.assetsQuester.file(url)
+        const { image_key } = await this.bot.internal.im.image.create({
+          image_type: 'message',
+          image: new File([data], filename, { type }),
+        })
+        return image_key
+      } catch (error) {
+        lastError = error
+        if (attempt < maxRetries) {
+          const delay = (attempt + 1) * 2000
+          this.bot.logger.warn(
+            'createImage attempt %d/%d failed, retrying in %dms: %s',
+            attempt + 1,
+            maxRetries + 1,
+            delay,
+            error instanceof Error ? error.message : String(error),
+          )
+          await new Promise(resolve => setTimeout(resolve, delay))
+        }
+      }
+    }
+
+    throw lastError
   }
 
   async sendFile(_type: 'video' | 'audio' | 'file', attrs: any) {
