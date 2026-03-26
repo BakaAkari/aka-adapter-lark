@@ -5,6 +5,107 @@ import { Im, ListChat, Message, User } from './types'
 import { MessageContent } from './content'
 import { hyphenate } from 'cosmokit'
 
+async function decodeRichTextContent<C extends Context = Context>(
+  bot: LarkBot<C>,
+  messageId: string,
+  json: MessageContent.RichText,
+): Promise<(string | h)[]> {
+  const content: (string | h)[] = []
+  // post content is keyed by locale; pick the first available locale
+  const locale = Object.keys(json)[0]
+  if (!locale) return content
+  const post = json[locale]
+  if (post.title) {
+    content.push(h('b', {}, post.title))
+    content.push('\n')
+  }
+  for (const paragraph of post.content) {
+    for (const element of paragraph) {
+      switch (element.tag) {
+        case 'text':
+          content.push((element as MessageContent.RichText.TextElement).text)
+          break
+        case 'a':
+          content.push(h('a', { href: (element as MessageContent.RichText.LinkElement).href }, (element as MessageContent.RichText.LinkElement).text))
+          break
+        case 'at': {
+          const at = element as MessageContent.RichText.AtElement
+          content.push(h.at(at.user_id))
+          break
+        }
+        case 'img': {
+          const img = element as MessageContent.RichText.ImageElement
+          content.push(h.image(await bot.getIncomingImageUrl(messageId, img.image_key)))
+          break
+        }
+        case 'media': {
+          const media = element as MessageContent.RichText.MediaElement
+          content.push(h.video(bot.getResourceUrl('file', messageId, media.file_key)))
+          break
+        }
+        case 'emoji':
+          content.push(h('face', { id: (element as MessageContent.RichText.EmotionElement).emoji_type }))
+          break
+        case 'code_block':
+          content.push(h('code', {}, (element as MessageContent.RichText.CodeBlockElement).text))
+          break
+        case 'hr':
+          content.push(h('hr'))
+          break
+        case 'md':
+          content.push((element as MessageContent.RichText.MarkdownElement).text)
+          break
+      }
+    }
+    content.push('\n')
+  }
+  // trim trailing newline
+  if (content.length && content[content.length - 1] === '\n') {
+    content.pop()
+  }
+  return content
+}
+
+function decodeCardContent(json: MessageContent.Card): (string | h)[] {
+  const content: (string | h)[] = []
+  const visit = (value: unknown) => {
+    if (!value) return
+    if (typeof value === 'string') return
+    if (Array.isArray(value)) {
+      value.forEach(visit)
+      return
+    }
+    if (typeof value === 'object') {
+      const obj = value as Record<string, unknown>
+      if (obj.tag === 'markdown' && typeof obj.content === 'string') {
+        content.push(obj.content as string)
+      } else if ((obj.tag === 'plain_text' || obj.tag === 'lark_md') && typeof obj.content === 'string') {
+        content.push(obj.content as string)
+      } else if (obj.tag === 'img' && typeof obj.img_key === 'string') {
+        // card images use img_key but we cannot resolve them without message_id context
+        content.push('[image]')
+      } else {
+        for (const child of Object.values(obj)) {
+          if (typeof child === 'object') visit(child)
+        }
+      }
+    }
+  }
+  if (json.header?.title) {
+    const title = json.header.title
+    content.push(h('b', {}, title.content))
+    content.push('\n')
+  }
+  if (json.body?.elements) {
+    visit(json.body.elements)
+  }
+  // trim trailing newline
+  if (content.length && content[content.length - 1] === '\n') {
+    content.pop()
+  }
+  return content
+}
+
 function detectImageMimeType(data: ArrayBuffer): string | undefined {
   const bytes = new Uint8Array(data)
   if (bytes.length >= 8
@@ -273,6 +374,15 @@ export async function adaptMessage<C extends Context = Context>(
     case 'file':
       content.push(h.file(bot.getResourceUrl('file', data.message.message_id, json.file_key)))
       break
+    case 'post':
+      content.push(...await decodeRichTextContent(bot, data.message.message_id, json as MessageContent.RichText))
+      break
+    case 'sticker':
+      content.push(h.image(bot.getResourceUrl('image', data.message.message_id, json.file_key)))
+      break
+    case 'interactive':
+      content.push(...decodeCardContent(json as MessageContent.Card))
+      break
   }
 
   session.timestamp = +data.message.create_time
@@ -453,6 +563,15 @@ export async function decodeMessage<C extends Context = Context>(bot: LarkBot<C>
       break
     case 'file':
       content.push(h.file(bot.getResourceUrl('file', body.message_id!, json.file_key)))
+      break
+    case 'post':
+      content.push(...(await decodeRichTextContent(bot, body.message_id!, json as MessageContent.RichText)).map(c => typeof c === 'string' ? h.text(c) : c))
+      break
+    case 'sticker':
+      content.push(h.image(bot.getResourceUrl('image', body.message_id!, json.file_key)))
+      break
+    case 'interactive':
+      content.push(...decodeCardContent(json as MessageContent.Card).map(c => typeof c === 'string' ? h.text(c) : c))
       break
   }
 

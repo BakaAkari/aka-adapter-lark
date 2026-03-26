@@ -27,6 +27,9 @@ interface CachedHydratedUserProfile {
 
 type IncomingImageMode = 'internal' | 'data-url'
 
+/** Maximum number of data-url entries kept in the incoming image cache. */
+const IMAGE_CACHE_MAX_SIZE = 256
+
 function formatHydrationError(error: unknown) {
   if (error instanceof HTTP.Error && error.response?.data) {
     const data = error.response.data as { code?: number; msg?: string }
@@ -102,6 +105,11 @@ export class LarkBot<C extends Context = Context, T extends LarkBot.Config = Lar
     try {
       const data = await this.internal.im.message.resource.get(messageId, imageKey, { type: 'image' })
       const dataUrl = Utils.createImageDataUrl(data)
+      if (this.incomingImageUrlCache.size >= IMAGE_CACHE_MAX_SIZE) {
+        // evict oldest entry (Map preserves insertion order)
+        const oldest = this.incomingImageUrlCache.keys().next().value
+        if (oldest !== undefined) this.incomingImageUrlCache.delete(oldest)
+      }
       this.incomingImageUrlCache.set(cacheKey, dataUrl)
       return dataUrl
     } catch (error) {
