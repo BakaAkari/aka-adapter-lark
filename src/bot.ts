@@ -252,53 +252,53 @@ export class LarkBot<C extends Context = Context, T extends LarkBot.Config = Lar
         const quoteId = session.quote?.id || body.event.message.parent_id || '-'
         const threadId = body.event.message.thread_id || '-'
         this.logger.info(
-          'inbound kind=message event=%s chat=%s messageType=%s user=%s channel=%s messageId=%s threadId=%s quoteId=%s content=%s',
+          'inbound user=%s content=%s kind=message event=%s chat=%s messageType=%s channel=%s messageId=%s threadId=%s quoteId=%s',
+          userLabel,
+          content,
           body.type,
           chat,
           body.event.message.message_type,
-          userLabel,
           channelId,
           body.event.message.message_id,
           threadId,
           quoteId,
-          content,
         )
         return
       }
       case 'im.chat.access_event.bot_p2p_chat_entered_v1':
         this.logger.info(
-          'inbound kind=event event=%s chat=%s user=%s channel=%s lastMessageId=%s',
+          'inbound user=%s kind=event event=%s chat=%s channel=%s lastMessageId=%s',
+          userLabel,
           body.type,
           chat,
-          userLabel,
           channelId,
           body.event.last_message_id || '-',
         )
         return
       case 'im.message.message_read_v1':
         this.logger.info(
-          'inbound kind=event event=%s user=%s readAt=%s messageIds=%s',
-          body.type,
+          'inbound user=%s kind=event event=%s readAt=%s messageIds=%s',
           userLabel,
+          body.type,
           body.event.reader.read_time,
           body.event.message_id_list.join(',') || '-',
         )
         return
       case 'application.bot.menu_v6':
         this.logger.info(
-          'inbound kind=event event=%s chat=%s user=%s command=%s',
+          'inbound user=%s kind=event event=%s chat=%s command=%s',
+          userLabel,
           body.type,
           chat,
-          userLabel,
           body.event.event_key,
         )
         return
       case 'card.action.trigger':
         this.logger.info(
-          'inbound kind=event event=%s chat=%s user=%s channel=%s actionTag=%s actionValue=%s',
+          'inbound user=%s kind=event event=%s chat=%s channel=%s actionTag=%s actionValue=%s',
+          userLabel,
           body.type,
           chat,
-          userLabel,
           body.event.context.open_chat_id || channelId,
           body.event.action.tag,
           this.summarizeText(JSON.stringify(body.event.action.value), '[none]'),
@@ -306,10 +306,10 @@ export class LarkBot<C extends Context = Context, T extends LarkBot.Config = Lar
         return
       default:
         this.logger.info(
-          'inbound kind=event event=%s chat=%s user=%s channel=%s',
+          'inbound user=%s kind=event event=%s chat=%s channel=%s',
+          userLabel,
           eventType,
           chat,
-          userLabel,
           channelId,
         )
     }
@@ -326,7 +326,8 @@ export class LarkBot<C extends Context = Context, T extends LarkBot.Config = Lar
     replyInThread?: boolean
   }) {
     this.logger.info(
-      'outbound kind=message operation=%s chat=%s channel=%s messageType=%s messageId=%s replyTo=%s threadReply=%s content=%s',
+      'outbound content=%s kind=message operation=%s chat=%s channel=%s messageType=%s messageId=%s replyTo=%s threadReply=%s',
+      this.summarizeText(entry.content),
       entry.operation,
       entry.chatKind || 'unknown',
       entry.channelId,
@@ -334,7 +335,6 @@ export class LarkBot<C extends Context = Context, T extends LarkBot.Config = Lar
       entry.messageId || '-',
       entry.replyTo || '-',
       entry.replyInThread ? 'yes' : 'no',
-      this.summarizeText(entry.content),
     )
   }
 

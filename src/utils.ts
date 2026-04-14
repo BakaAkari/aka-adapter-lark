@@ -15,11 +15,14 @@ async function decodeRichTextContent<C extends Context = Context>(
   const locale = Object.keys(json)[0]
   if (!locale) return content
   const post = json[locale]
+  if (!post) return content
   if (post.title) {
     content.push(h('b', {}, post.title))
     content.push('\n')
   }
+  if (!Array.isArray(post.content)) return content
   for (const paragraph of post.content) {
+    if (!Array.isArray(paragraph)) continue
     for (const element of paragraph) {
       switch (element.tag) {
         case 'text':

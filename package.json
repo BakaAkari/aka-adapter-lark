@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-aka-adapter-lark",
-  "version": "0.1.6",
+  "version": "0.2.0",
   "description": "Optimized fork of the official adapter-lark plugin for Koishi.",
   "license": "MIT",
   "repository": {
