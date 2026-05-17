@@ -22,10 +22,12 @@
 - `aka-adapter-lark`: 负责飞书事件接入和 Koishi session 质量
 - `aka-lark-center`: 负责飞书 API、权限、资源读取和 LLM / ChatLuna 可用表示
 
-架构说明见：
+当前文档入口见：
 
-- [`docs/lark-center-doc/architecture.md`](../../docs/lark-center-doc/architecture.md)
-- [`docs/lark-center-doc/context-injection.md`](../../docs/lark-center-doc/context-injection.md)
+- [`docs/active-documents.md`](../../docs/active-documents.md)
+- [`docs/lark-center-doc/current-status.md`](../../docs/lark-center-doc/current-status.md)
+
+历史架构和上下文注入说明已归档到 [`docs/archive/lark-center/`](../../docs/archive/lark-center/)，除非明确恢复历史线，否则不作为当前实现需求。
 
 ## Config
 
