@@ -10,6 +10,8 @@ export class LarkMessageEncoder<C extends Context = Context> extends MessageEnco
   private quote: Dict | undefined
   private textContent = ''
   private richContent: MessageContent.RichText.Paragraph[] = []
+  private richParagraph: MessageContent.RichText.InlineElement[] = []
+  private currentStyles: MessageContent.RichText.Style[] = []
   private card: MessageContent.Card | undefined
   private elements: MessageContent.Card.Element[] = []
   private inline = false
@@ -101,11 +103,95 @@ export class LarkMessageEncoder<C extends Context = Context> extends MessageEnco
     }
   }
 
+  private createStyledElement<T extends MessageContent.RichText.TextElement | MessageContent.RichText.LinkElement | MessageContent.RichText.AtElement>(element: T): T {
+    if (this.currentStyles.length) {
+      return { ...element, style: [...new Set(this.currentStyles)] } as T
+    }
+    return element
+  }
+
+  private pushRichInline(element: MessageContent.RichText.InlineElement) {
+    if (this.card) return
+    this.richParagraph.push(element)
+  }
+
+  private flushRichParagraph() {
+    if (!this.richParagraph.length) return
+    this.richContent.push(this.richParagraph)
+    this.richParagraph = []
+  }
+
+  private pushRichBlock(element: MessageContent.RichText.BlockElement) {
+    this.flushRichParagraph()
+    this.richContent.push([element])
+  }
+
+  private appendRichText(text: string) {
+    if (!text) return
+    const lines = text.split('\n')
+    lines.forEach((line, index) => {
+      if (index) this.flushRichParagraph()
+      if (!line) return
+      this.pushRichInline(this.createStyledElement({
+        tag: 'text',
+        text: line,
+      }))
+    })
+  }
+
   private flushText() {
     if (!this.textContent) return
-    this.richContent.push([{ tag: 'md', text: this.textContent }])
-    this.elements.push({ tag: 'markdown', content: this.textContent })
+    if (this.card) {
+      this.elements.push({ tag: 'markdown', content: this.textContent })
+    } else {
+      this.appendRichText(this.textContent)
+    }
     this.textContent = ''
+  }
+
+  private async collectText(children: h[]) {
+    const previousText = this.textContent
+    const previousParagraph = this.richParagraph
+    const previousStyles = this.currentStyles
+    const previousElements = this.elements
+    const previousInline = this.inline
+    const previousRichContent = this.richContent
+
+    this.textContent = ''
+    this.richParagraph = []
+    this.currentStyles = []
+    this.elements = []
+    this.inline = true
+    this.richContent = []
+
+    try {
+      await this.render(children)
+      return this.textContent
+        || this.richParagraph.map((item) => {
+          if (item.tag === 'text') return item.text
+          if (item.tag === 'a') return item.text
+          if (item.tag === 'at') return item.user_id
+          if (item.tag === 'emotion' || item.tag === 'emoji') return item.emoji_type
+          return item.tag === 'md' ? item.text : ''
+        }).join('')
+        || this.elements.map((item) => 'content' in item ? String(item.content) : '').join('')
+    } finally {
+      this.textContent = previousText
+      this.richParagraph = previousParagraph
+      this.currentStyles = previousStyles
+      this.elements = previousElements
+      this.inline = previousInline
+      this.richContent = previousRichContent
+    }
+  }
+
+  private async renderWithStyle(style: MessageContent.RichText.Style, children: h[]) {
+    this.currentStyles.push(style)
+    try {
+      await this.render(children)
+    } finally {
+      this.currentStyles.pop()
+    }
   }
 
   private describeRichContent() {
@@ -147,6 +233,7 @@ export class LarkMessageEncoder<C extends Context = Context> extends MessageEnco
 
   async flush() {
     this.flushText()
+    this.flushRichParagraph()
     if (!this.card && !this.richContent.length) return
 
     if (this.card) {
@@ -173,7 +260,10 @@ export class LarkMessageEncoder<C extends Context = Context> extends MessageEnco
     this.quote = undefined
     this.textContent = ''
     this.richContent = []
+    this.richParagraph = []
+    this.currentStyles = []
     this.card = undefined
+    this.elements = []
   }
 
   async createImage(url: string) {
@@ -277,7 +367,12 @@ export class LarkMessageEncoder<C extends Context = Context> extends MessageEnco
   async visit(element: h) {
     const { type, attrs, children } = element
     if (type === 'text') {
-      this.textContent += attrs.content
+      if (this.card || !this.currentStyles.length) {
+        this.textContent += attrs.content
+      } else {
+        this.flushText()
+        this.appendRichText(attrs.content)
+      }
     } else if (type === 'at') {
       if (this.card) {
         if (attrs.type === 'all') {
@@ -286,35 +381,96 @@ export class LarkMessageEncoder<C extends Context = Context> extends MessageEnco
           this.textContent += `<at id=${attrs.id}>${attrs.name ?? ''}</at>`
         }
       } else {
-        if (attrs.type === 'all') {
-          this.textContent += `<at user_id="all">${attrs.name ?? ''}</at>`
-        } else {
-          this.textContent += `<at user_id="${attrs.id}">${attrs.name ?? ''}</at>`
-        }
+        this.flushText()
+        this.pushRichInline(this.createStyledElement({
+          tag: 'at',
+          user_id: attrs.type === 'all' ? 'all' : attrs.id,
+        }))
       }
     } else if (type === 'a') {
-      await this.render(children)
-      if (attrs.href) this.textContent += ` (${attrs.href})`
+      if (this.card) {
+        const text = await this.collectText(children)
+        this.textContent += attrs.href ? `[${text || attrs.href}](${attrs.href})` : text
+      } else {
+        this.flushText()
+        const text = await this.collectText(children)
+        if (attrs.href) {
+          this.pushRichInline(this.createStyledElement({
+            tag: 'a',
+            text: text || attrs.href,
+            href: attrs.href,
+          }))
+        } else {
+          this.textContent += text
+        }
+      }
     } else if (type === 'p') {
-      if (!this.textContent.endsWith('\n')) this.textContent += '\n'
-      await this.render(children)
-      if (!this.textContent.endsWith('\n')) this.textContent += '\n'
+      if (this.card) {
+        if (!this.textContent.endsWith('\n')) this.textContent += '\n'
+        await this.render(children)
+        if (!this.textContent.endsWith('\n')) this.textContent += '\n'
+      } else {
+        this.flushText()
+        await this.render(children)
+        this.flushText()
+        this.flushRichParagraph()
+      }
     } else if (type === 'br') {
-      this.textContent += '\n'
+      if (this.card) {
+        this.textContent += '\n'
+      } else {
+        this.flushText()
+        this.flushRichParagraph()
+      }
     } else if (type === 'sharp') {
       // platform does not support sharp
     } else if (type === 'quote') {
       await this.flush()
       this.quote = attrs
+    } else if (type === 'b' || type === 'strong') {
+      await this.renderWithStyle('bold', children)
+    } else if (type === 'i' || type === 'em') {
+      await this.renderWithStyle('italic', children)
+    } else if (type === 'u') {
+      await this.renderWithStyle('underline', children)
+    } else if (type === 's' || type === 'del') {
+      await this.renderWithStyle('lineThrough', children)
+    } else if (type === 'code') {
+      if (this.card) {
+        this.textContent += '`'
+        await this.render(children)
+        this.textContent += '`'
+      } else {
+        this.flushText()
+        const text = await this.collectText(children)
+        this.pushRichBlock({ tag: 'code_block', text })
+      }
+    } else if (type === 'pre') {
+      this.flushText()
+      const text = await this.collectText(children)
+      if (this.card) {
+        this.textContent += `\n\`\`\`\n${text}\n\`\`\`\n`
+      } else {
+        this.pushRichBlock({ tag: 'code_block', language: attrs.lang || attrs.language, text })
+      }
+    } else if (type === 'face' || type === 'emoji') {
+      if (this.card) {
+        this.textContent += attrs.name || attrs.id || attrs.emojiType || ''
+      } else {
+        this.flushText()
+        const emoji_type = attrs.id || attrs.emojiType || attrs.name
+        if (emoji_type) this.pushRichInline({ tag: 'emotion', emoji_type })
+      }
     } else if (type === 'img' || type === 'image') {
       this.flushText()
       const image_key = await this.createImage(attrs.src || attrs.url)
-      this.richContent.push([{ tag: 'img', image_key }])
+      this.pushRichBlock({ tag: 'img', image_key })
     } else if (['video', 'audio', 'file'].includes(type)) {
       await this.flush()
       await this.sendFile(type as any, attrs)
     } else if (type === 'lark:img') {
       this.flushText()
+      if (!this.card && attrs.imgKey) this.pushRichBlock({ tag: 'img', image_key: attrs.imgKey })
       this.elements.push({
         tag: 'img',
         alt: attrs.alt,
@@ -332,7 +488,7 @@ export class LarkMessageEncoder<C extends Context = Context> extends MessageEnco
       await this.render(children, true)
     } else if (type === 'hr') {
       this.flushText()
-      this.richContent.push([{ tag: 'hr' }])
+      this.pushRichBlock({ tag: 'hr' })
       this.elements.push({
         tag: 'hr',
         margin: attrs.margin,

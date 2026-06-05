@@ -118,7 +118,7 @@ export namespace MessageContent {
       image_key?: string
     }
 
-    export interface EmotionElement extends BaseElement<'emoji'> {
+    export interface EmotionElement extends BaseElement<'emotion' | 'emoji'> {
       emoji_type: string
     }
 

@@ -5,6 +5,71 @@ import { Im, ListChat, Message, User } from './types'
 import { MessageContent } from './content'
 import { hyphenate } from 'cosmokit'
 
+type LarkMention = {
+  key: string
+  id?: string | UserIds
+  name?: string
+}
+
+function normalizeContent(content: (string | h)[]): h[] {
+  return content.map((item) => typeof item === 'string' ? h.text(item) : item)
+}
+
+function applyRichTextStyle(content: string | h | (string | h)[], style?: MessageContent.RichText.Style[]): string | h | (string | h)[] {
+  if (!style?.length) return content
+  let current = Array.isArray(content) ? content : [content]
+  for (const item of [...style].reverse()) {
+    if (item === 'bold') current = [h('b', {}, current)]
+    if (item === 'italic') current = [h('i', {}, current)]
+    if (item === 'underline') current = [h('u', {}, current)]
+    if (item === 'lineThrough') current = [h('s', {}, current)]
+  }
+  return current.length === 1 ? current[0] : current
+}
+
+function pushStyled(content: (string | h)[], value: string | h | (string | h)[], style?: MessageContent.RichText.Style[]) {
+  const styled = applyRichTextStyle(value, style)
+  if (Array.isArray(styled)) {
+    content.push(...styled)
+  } else {
+    content.push(styled)
+  }
+}
+
+function decodeTextContent(text: string, mentions: LarkMention[] = []): (string | h)[] {
+  const content: (string | h)[] = []
+  const mentionMatches = mentions
+    .filter((mention) => mention.key)
+    .map((mention) => ({
+      type: 'mention' as const,
+      index: text.indexOf(mention.key),
+      length: mention.key.length,
+      mention,
+    }))
+    .filter((match) => match.index >= 0)
+  const linkRegex = /\[([^\]\n]+)]\((https?:\/\/[^\s)]+)\)/g
+  const linkMatches: { type: 'link'; index: number; length: number; text: string; href: string }[] = []
+  for (let match = linkRegex.exec(text); match; match = linkRegex.exec(text)) {
+    linkMatches.push({ type: 'link', index: match.index, length: match[0].length, text: match[1], href: match[2] })
+  }
+  const matches = [...mentionMatches, ...linkMatches]
+    .sort((a, b) => a.index - b.index || b.length - a.length)
+  let offset = 0
+  for (const match of matches) {
+    if (match.index < offset) continue
+    if (match.index > offset) content.push(text.slice(offset, match.index))
+    if (match.type === 'mention') {
+      const id = typeof match.mention.id === 'string' ? match.mention.id : match.mention.id?.open_id
+      content.push(h.at(id || match.mention.key, { name: match.mention.name }))
+    } else {
+      content.push(h('a', { href: match.href }, match.text))
+    }
+    offset = match.index + match.length
+  }
+  if (offset < text.length) content.push(text.slice(offset))
+  return content
+}
+
 async function decodeRichTextContent<C extends Context = Context>(
   bot: LarkBot<C>,
   messageId: string,
@@ -25,15 +90,19 @@ async function decodeRichTextContent<C extends Context = Context>(
     if (!Array.isArray(paragraph)) continue
     for (const element of paragraph) {
       switch (element.tag) {
-        case 'text':
-          content.push((element as MessageContent.RichText.TextElement).text)
+        case 'text': {
+          const text = element as MessageContent.RichText.TextElement
+          pushStyled(content, text.text, text.style)
           break
-        case 'a':
-          content.push(h('a', { href: (element as MessageContent.RichText.LinkElement).href }, (element as MessageContent.RichText.LinkElement).text))
+        }
+        case 'a': {
+          const link = element as MessageContent.RichText.LinkElement
+          pushStyled(content, h('a', { href: link.href }, link.text), link.style)
           break
+        }
         case 'at': {
           const at = element as MessageContent.RichText.AtElement
-          content.push(h.at(at.user_id))
+          pushStyled(content, h.at(at.user_id), at.style)
           break
         }
         case 'img': {
@@ -46,6 +115,7 @@ async function decodeRichTextContent<C extends Context = Context>(
           content.push(h.video(bot.getResourceUrl('file', messageId, media.file_key)))
           break
         }
+        case 'emotion':
         case 'emoji':
           content.push(h('face', { id: (element as MessageContent.RichText.EmotionElement).emoji_type }))
           break
@@ -345,22 +415,7 @@ export async function adaptMessage<C extends Context = Context>(
   switch (data.message.message_type) {
     case 'text': {
       const text = json.text as string
-      if (!data.message.mentions?.length) {
-        content.push(text)
-        break
-      }
-
-      // Lark's `at` Element would be `@user_id` in text
-      text.split(' ').forEach((word) => {
-        if (word.startsWith('@')) {
-          const mention = data.message.mentions.find((mention) => mention.key === word)!
-          if (mention) {
-            content.push(h.at(mention.id.open_id, { name: mention.name }))
-            return
-          }
-        }
-        content.push(word)
-      })
+      content.push(...decodeTextContent(text, data.message.mentions))
       break
     }
     case 'image':
@@ -535,22 +590,7 @@ export async function decodeMessage<C extends Context = Context>(bot: LarkBot<C>
   switch (body.msg_type) {
     case 'text': {
       const text = json.text as string
-      if (!body.mentions?.length) {
-        content.push(h.text(text))
-        break
-      }
-
-      // Lark's `at` Element would be `@user_id` in text
-      text.split(' ').forEach((word) => {
-        if (word.startsWith('@')) {
-          const mention = body.mentions!.find((mention) => mention.key === word)!
-          if (mention) {
-            content.push(h.at(mention.id, { name: mention.name }))
-            return
-          }
-        }
-        content.push(h.text(word))
-      })
+      content.push(...normalizeContent(decodeTextContent(text, body.mentions)))
       break
     }
     case 'image':
