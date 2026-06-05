@@ -307,9 +307,8 @@ export class LarkMessageEncoder<C extends Context = Context> extends MessageEnco
       await this.flush()
       this.quote = attrs
     } else if (type === 'img' || type === 'image') {
-      const image_key = await this.createImage(attrs.src || attrs.url)
-      this.textContent += `![${attrs.alt ?? '图片'}](${image_key})`
       this.flushText()
+      const image_key = await this.createImage(attrs.src || attrs.url)
       this.richContent.push([{ tag: 'img', image_key }])
     } else if (['video', 'audio', 'file'].includes(type)) {
       await this.flush()
