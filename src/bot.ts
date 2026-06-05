@@ -453,6 +453,7 @@ export namespace LarkBot {
     profileCacheTtl: number
     profileFailureCacheTtl: number
     incomingImageMode: IncomingImageMode
+    outgoingRichTextDebug: boolean
   }
 
   export type Config = BaseConfig & (HttpServer.Options | WsClient.Options)
@@ -466,6 +467,7 @@ export namespace LarkBot {
       profileCacheTtl: Schema.number().min(60).default(3600).description('用户资料成功缓存时长，单位为秒。'),
       profileFailureCacheTtl: Schema.number().min(10).default(300).description('用户资料查询失败缓存时长，单位为秒。'),
       incomingImageMode: Schema.union(['internal', 'data-url']).default('internal').description('收到图片消息时输出的资源格式。`data-url` 可兼容不支持 `internal:` 协议的插件。'),
+      outgoingRichTextDebug: Schema.boolean().default(false).description('输出富文本编码诊断日志，包含链接节点 children 和最终 post payload。仅建议排查渲染问题时临时开启。'),
       protocol: process.env.KOISHI_ENV === 'browser'
         ? Schema.const('ws').default('ws')
         : Schema.union(['http', 'ws']).description('选择要使用的协议。').default('http'),

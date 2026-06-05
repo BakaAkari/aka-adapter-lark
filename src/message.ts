@@ -149,6 +149,24 @@ export class LarkMessageEncoder<C extends Context = Context> extends MessageEnco
     this.textContent = ''
   }
 
+  private describeElementTree(elements: h[]): unknown[] {
+    return elements.map((element) => {
+      const attrs = element.attrs ?? {}
+      return {
+        type: element.type,
+        attrs: element.type === 'text'
+          ? { content: attrs.content }
+          : Object.fromEntries(Object.entries(attrs).filter(([key]) => key !== 'src' && key !== 'url')),
+        children: element.children?.length ? this.describeElementTree(element.children) : undefined,
+      }
+    })
+  }
+
+  private logRichTextDebug(message: string, data: Record<string, unknown>) {
+    if (!this.bot.config.outgoingRichTextDebug) return
+    this.bot.logger.debug('%s %o', message, JSON.parse(JSON.stringify(data)))
+  }
+
   private async collectText(children: h[]) {
     const previousText = this.textContent
     const previousParagraph = this.richParagraph
@@ -246,13 +264,15 @@ export class LarkMessageEncoder<C extends Context = Context> extends MessageEnco
       }, logContent)
     } else {
       const logContent = this.describeRichContent()
+      const content = {
+        zh_cn: {
+          content: this.richContent,
+        },
+      }
+      this.logRichTextDebug('outbound rich post payload', { content })
       await this.post({
         msg_type: 'post',
-        content: JSON.stringify({
-          zh_cn: {
-            content: this.richContent,
-          },
-        }),
+        content: JSON.stringify(content),
       }, logContent)
     }
 
@@ -390,10 +410,22 @@ export class LarkMessageEncoder<C extends Context = Context> extends MessageEnco
     } else if (type === 'a') {
       if (this.card) {
         const text = await this.collectText(children)
+        this.logRichTextDebug('outbound link encode', {
+          mode: 'card',
+          href: attrs.href,
+          text,
+          children: this.describeElementTree(children),
+        })
         this.textContent += attrs.href ? `[${text || attrs.href}](${attrs.href})` : text
       } else {
         this.flushText()
         const text = await this.collectText(children)
+        this.logRichTextDebug('outbound link encode', {
+          mode: 'post',
+          href: attrs.href,
+          text,
+          children: this.describeElementTree(children),
+        })
         if (attrs.href) {
           this.pushRichInline(this.createStyledElement({
             tag: 'a',
