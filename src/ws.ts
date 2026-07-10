@@ -133,6 +133,8 @@ export class WsClient<C extends Context = Context> extends Adapter.WsClient<C, L
         body.type = body.header.event_type
         const session = await adaptSession(this.bot, body)
         this.bot.logIncomingSession(session, body)
+        // A 能力：入站消息前置钩子（fire-and-forget，不阻塞 dispatch）
+        void this.bot.onInboundBeforeDispatch(body)
         this.bot.dispatch(session)
 
         this.send({

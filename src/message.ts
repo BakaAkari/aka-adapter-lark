@@ -3,6 +3,12 @@ import { LarkBot } from './bot'
 import { Im, Message } from './types'
 import { EventPayload, extractIdType } from './utils'
 import { MessageContent } from './content'
+import { isEditExhausted } from './features/edit-relay'
+import {
+  extractLarkErrorInfo,
+  formatErrorMessage,
+  isSurfaceableError,
+} from './features/error-surfacing'
 
 export class LarkMessageEncoder<C extends Context = Context> extends MessageEncoder<C, LarkBot<C>> {
   declare referrer?: EventPayload
@@ -44,21 +50,47 @@ export class LarkMessageEncoder<C extends Context = Context> extends MessageEnco
         operation = 'edit'
         const messageId = this.editMessageIds.pop()
         if (!messageId) throw new Error('No message to edit')
-        if (data.msg_type === 'interactive') {
-          delete data.msg_type
-          await this.bot.internal.im.message.patch(messageId, data)
-        } else {
-          await this.bot.internal.im.message.update(messageId, data)
+
+        // B 能力：达到本地阈值时提前熔断，直接走续接
+        const relayEnabled = this.bot.config.messageEditRelay
+        const threshold = this.bot.config.messageEditThreshold
+        if (relayEnabled && this.bot.editRelay.isLocalExhausted(messageId, threshold)) {
+          await this.relayAsNew(messageId, data, logContent, 'local-threshold', quote)
+          return
         }
-        this.bot.logOutgoingMessage({
-          operation,
-          channelId: this.channelId,
-          messageId,
-          messageType: data?.msg_type,
-          content: logContent,
-          chatKind: this.session.isDirect ? 'direct' : (this.session.channelId || this.session.guildId ? 'group' : 'unknown'),
-        })
-        return
+
+        const messageTypeForLog = data?.msg_type
+        try {
+          if (data.msg_type === 'interactive') {
+            // patch 请求体不能包含 msg_type
+            const patchPayload = { ...data }
+            delete patchPayload.msg_type
+            await this.bot.internal.im.message.patch(messageId, patchPayload)
+          } else {
+            await this.bot.internal.im.message.update(messageId, data)
+          }
+          this.bot.editRelay.incrementEdit(messageId)
+          this.bot.logOutgoingMessage({
+            operation,
+            channelId: this.channelId,
+            messageId,
+            messageType: messageTypeForLog,
+            content: logContent,
+            chatKind: this.session.isDirect ? 'direct' : (this.session.channelId || this.session.guildId ? 'group' : 'unknown'),
+          })
+          // C 能力：成功编辑视为一次成功 outbound，抑制排队中的错误提示
+          this.bot.errorSurfacing.consume(this.channelId)
+          // A 能力：成功 outbound，安排延迟撤销该会话的思考期 reaction
+          this.bot.notifyOutboundForReaction(this.channelId)
+          return
+        } catch (editError) {
+          // B 能力：飞书 230072 表示编辑次数打满，透明续接为新消息
+          if (relayEnabled && isEditExhausted(editError)) {
+            await this.relayAsNew(messageId, data, logContent, 'lark-230072', quote)
+            return
+          }
+          throw editError
+        }
       } else if (quote?.id) {
         operation = 'reply'
         resp = await this.bot.internal.im.message.reply(quote.id, {
@@ -91,6 +123,10 @@ export class LarkMessageEncoder<C extends Context = Context> extends MessageEnco
       session.guildId = this.session.guildId
       session.app.emit(session, 'send', session)
       this.results.push(session.event.message)
+      // C 能力：成功发送视为一次成功 outbound，抑制排队中的错误提示
+      this.bot.errorSurfacing.consume(this.channelId)
+      // A 能力：成功 outbound，安排延迟撤销该会话的思考期 reaction
+      this.bot.notifyOutboundForReaction(this.channelId)
     } catch (e) {
       // try to extract error message from Lark API
       if (this.bot.http.isError(e)) {
@@ -99,7 +135,135 @@ export class LarkMessageEncoder<C extends Context = Context> extends MessageEnco
           e.message += ` (Lark error code ${e.response.data.code}: ${e.response.data.msg ?? generalErrorMsg})`
         }
       }
+      // C 能力：如果是「消息级」错误且启用了 surfaceErrors，排队一条用户可见提示
+      if (this.bot.config.surfaceErrors && isSurfaceableError(e)) {
+        const info = extractLarkErrorInfo(e)
+        const content = formatErrorMessage(this.bot.config.errorMessageTemplate, info)
+        this.bot.errorSurfacing.enqueue(
+          this.channelId,
+          content,
+          this.bot.config.errorSurfaceDelayMs,
+          (channelId, text) => this.bot.deliverErrorMessage(channelId, text),
+        )
+        this.bot.logger.warn(
+          'queued surfaceable error channel=%s code=%s msg=%s delayMs=%d',
+          this.channelId,
+          info.code,
+          info.msg,
+          this.bot.config.errorSurfaceDelayMs,
+        )
+      }
       this.errors.push(e)
+    }
+  }
+
+  /**
+   * B 能力：编辑达到本地阈值或飞书 230072 时，把当次编辑内容作为新消息发出，
+   * 并把 old → new 登记到 bot.editRelay，让后续对旧 messageId 的编辑透明重定向。
+   *
+   * 走 quote 或 create 路径，取决于是否有 referrer / quote。
+   * 卡片消息（interactive）不 reply，直接 create，避免嵌在引用块里。
+   */
+  private async relayAsNew(
+    prevMessageId: string,
+    data: any,
+    logContent: string | undefined,
+    reason: 'local-threshold' | 'lark-230072',
+    quote: Dict | undefined,
+  ): Promise<void> {
+    const factory = async (): Promise<string> => {
+      let resp: Message
+      let operation: 'create' | 'reply' = 'create'
+      const msgType = data?.msg_type
+      const canReply = msgType !== 'interactive' && quote?.id
+
+      if (canReply) {
+        operation = 'reply'
+        resp = await this.bot.internal.im.message.reply(quote.id, {
+          ...data,
+          reply_in_thread: quote.replyInThread,
+        })
+      } else {
+        operation = 'create'
+        const createPayload = { ...data, receive_id: this.channelId }
+        resp = await this.bot.internal.im.message.create(createPayload, {
+          receive_id_type: extractIdType(this.channelId),
+        })
+      }
+
+      if (!resp) {
+        throw new Error('edit relay: empty response from Lark on create/reply')
+      }
+
+      this.bot.logger.info(
+        'edit relayed prev=%s new=%s reason=%s operation=%s',
+        prevMessageId,
+        resp.message_id,
+        reason,
+        operation,
+      )
+
+      // 登记重定向：后续 chatluna 用 prev id 编辑时会被解析到 new id
+      this.bot.editRelay.recordRedirect(prevMessageId, resp.message_id)
+
+      this.bot.logOutgoingMessage({
+        operation,
+        channelId: this.channelId,
+        messageId: resp.message_id,
+        messageType: msgType,
+        content: logContent,
+        chatKind: this.session.isDirect
+          ? 'direct'
+          : (this.session.channelId || this.session.guildId ? 'group' : 'unknown'),
+        replyTo: canReply ? quote?.id : undefined,
+        replyInThread: canReply ? quote?.replyInThread : undefined,
+      })
+
+      // 续接产生的是一条新消息，emit send 事件让 Koishi 记录一致
+      const emitSession = this.bot.session()
+      emitSession.messageId = resp.message_id
+      emitSession.timestamp = Number(resp.create_time) * 1000
+      emitSession.userId = resp.sender.id
+      emitSession.channelId = this.session.channelId
+      emitSession.guildId = this.session.guildId
+      emitSession.app.emit(emitSession, 'send', emitSession)
+      this.results.push(emitSession.event.message)
+      // C 能力：续接成功也是一次成功 outbound，抑制排队中的错误提示
+      this.bot.errorSurfacing.consume(this.channelId)
+      // A 能力：续接成功也算 outbound，安排延迟撤销思考期 reaction
+      this.bot.notifyOutboundForReaction(this.channelId)
+
+      return resp.message_id
+    }
+
+    try {
+      await this.bot.editRelay.serializeRelay(prevMessageId, factory)
+    } catch (relayError) {
+      // 续接失败时把错误压入 errors，交给上层（chatluna）处理
+      if (this.bot.http.isError(relayError)) {
+        if (relayError.response?.data?.code) {
+          const generalErrorMsg = `Check error code at https://open.larksuite.com/document/server-docs/getting-started/server-error-codes`
+          relayError.message += ` (Lark error code ${relayError.response.data.code}: ${relayError.response.data.msg ?? generalErrorMsg})`
+        }
+      }
+      // C 能力：续接失败也走排队错误提示（往往是真实的消息级错误）
+      if (this.bot.config.surfaceErrors && isSurfaceableError(relayError)) {
+        const info = extractLarkErrorInfo(relayError)
+        const content = formatErrorMessage(this.bot.config.errorMessageTemplate, info)
+        this.bot.errorSurfacing.enqueue(
+          this.channelId,
+          content,
+          this.bot.config.errorSurfaceDelayMs,
+          (channelId, text) => this.bot.deliverErrorMessage(channelId, text),
+        )
+        this.bot.logger.warn(
+          'queued surfaceable relay error channel=%s code=%s msg=%s',
+          this.channelId,
+          info.code,
+          info.msg,
+        )
+      }
+      this.errors.push(relayError)
     }
   }
 

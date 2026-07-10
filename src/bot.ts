@@ -5,6 +5,14 @@ import { WsClient } from './ws'
 import { LarkMessageEncoder } from './message'
 import { Internal } from './internal'
 import * as Utils from './utils'
+import { EditRelayState } from './features/edit-relay'
+import {
+  ErrorSurfacingState,
+  extractLarkErrorInfo,
+  formatErrorMessage,
+  isSurfaceableError,
+} from './features/error-surfacing'
+import { ThinkingReactionState } from './features/thinking-reaction'
 
 const fileTypeMap: Record<Exclude<Im.File.CreateForm['file_type'], 'stream'>, string[]> = {
   opus: ['audio/opus'],
@@ -54,6 +62,16 @@ export class LarkBot<C extends Context = Context, T extends LarkBot.Config = Lar
   private userProfileHydrationWarningEmitted = false
   private incomingImageUrlCache = new Map<string, string>()
 
+  /** B 能力：编辑计数 + 续接重定向表。encoder 层直接访问。 */
+  public readonly editRelay = new EditRelayState()
+  private _editRelayCleanupTimer?: NodeJS.Timeout
+
+  /** C 能力：失败提示排队（短延迟抑制）。encoder 层直接访问 enqueue。 */
+  public readonly errorSurfacing = new ErrorSurfacingState()
+
+  /** A 能力：思考期 reaction 追踪。 */
+  public readonly thinkingReactions = new ThinkingReactionState()
+
   constructor(ctx: C, config: T) {
     super(ctx, config, 'lark')
 
@@ -68,6 +86,23 @@ export class LarkBot<C extends Context = Context, T extends LarkBot.Config = Lar
     } else if (config.protocol === 'ws') {
       ctx.plugin(WsClient, this as any)
     }
+
+    // B 能力：定期清理过期的编辑续接重定向条目，防止内存无限增长
+    if (config.messageEditRelay && config.messageEditRedirectTtlMs > 0) {
+      const cleanupInterval = Math.max(60_000, Math.floor(config.messageEditRedirectTtlMs / 2))
+      this._editRelayCleanupTimer = setInterval(() => {
+        this.editRelay.cleanupExpired(config.messageEditRedirectTtlMs)
+      }, cleanupInterval)
+    }
+    ctx.on('dispose', () => {
+      if (this._editRelayCleanupTimer) {
+        clearInterval(this._editRelayCleanupTimer)
+        this._editRelayCleanupTimer = undefined
+      }
+      this.editRelay.clear()
+      this.errorSurfacing.clear()
+      this.thinkingReactions.clear()
+    })
 
     this.defineInternalRoute('/*path', async ({ params, method, headers, body, query }) => {
       const response = await this.http('/' + params.path, {
@@ -166,9 +201,106 @@ export class LarkBot<C extends Context = Context, T extends LarkBot.Config = Lar
   }
 
   async editMessage(channelId: string, messageId: string, content: h.Fragment) {
+    // B 能力：如果历史 messageId 已被续接过，把编辑请求重定向到最新的消息 id 上
+    const effectiveId = this.config.messageEditRelay
+      ? this.editRelay.resolve(messageId)
+      : messageId
+    if (effectiveId !== messageId) {
+      this.logger.debug('editMessage redirected: prev=%s current=%s', messageId, effectiveId)
+    }
     const encoder = new LarkMessageEncoder(this, channelId)
-    encoder.editMessageIds = [messageId]
+    encoder.editMessageIds = [effectiveId]
     await encoder.send(content)
+  }
+
+  /**
+   * C 能力：把错误提示作为独立新消息发送。
+   * 不走 encoder（避免递归），不 emit send（避免污染统计）。
+   */
+  async deliverErrorMessage(channelId: string, content: string): Promise<void> {
+    try {
+      await this.internal.im.message.create({
+        receive_id: channelId,
+        msg_type: 'text',
+        content: JSON.stringify({ text: content }),
+      }, {
+        receive_id_type: Utils.extractIdType(channelId),
+      })
+      this.logger.info('surfaced error to user channel=%s content=%s', channelId, content)
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      this.logger.warn('failed to deliver error message channel=%s detail=%s', channelId, detail)
+    }
+  }
+
+  /**
+   * A 能力：入站消息前置钩子。给用户消息加"思考中"reaction。
+   * 必须 fire-and-forget（不阻塞 dispatch）。由 ws.ts / http.ts 调用。
+   */
+  async onInboundBeforeDispatch(body: Utils.EventPayload): Promise<void> {
+    if (!this.config.thinkingReaction) return
+    if (body.type !== 'im.message.receive_v1') return
+
+    const event = body.event
+    const messageId = event?.message?.message_id
+    const chatId = event?.message?.chat_id
+    if (!messageId || !chatId) return
+
+    // 避免给机器人自己发的消息加 reaction（虽然通常入站事件不会包含自己）
+    const senderType = event?.sender?.sender_type
+    if (senderType === 'app') return
+
+    if (this.thinkingReactions.has(messageId)) return
+
+    try {
+      const resp = await this.internal.im.message.reaction.create(messageId, {
+        reaction_type: { emoji_type: this.config.thinkingReactionEmoji },
+      })
+      const reactionId = resp?.reaction_id
+      if (!reactionId) {
+        this.logger.warn('thinking reaction created but reactionId missing messageId=%s', messageId)
+        return
+      }
+      this.thinkingReactions.register(
+        messageId,
+        chatId,
+        reactionId,
+        this.config.thinkingReactionTtlMs,
+        (mid, rid) => this.deleteThinkingReaction(mid, rid),
+      )
+      this.logger.debug('thinking reaction added messageId=%s reactionId=%s emoji=%s',
+        messageId, reactionId, this.config.thinkingReactionEmoji)
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      this.logger.warn('failed to add thinking reaction messageId=%s detail=%s', messageId, detail)
+    }
+  }
+
+  /**
+   * A 能力：机器人在某会话 outbound 成功后调用。
+   * 安排延迟撤销该会话下所有 pending 的思考期 reaction。
+   */
+  notifyOutboundForReaction(channelId: string): void {
+    if (!this.config.thinkingReaction) return
+    this.thinkingReactions.scheduleRetireForChannel(
+      channelId,
+      this.config.thinkingReactionRetireDelayMs,
+      (mid, rid) => this.deleteThinkingReaction(mid, rid),
+    )
+  }
+
+  /** 内部：撤销单个 reaction，失败 warn 不抛。 */
+  private async deleteThinkingReaction(messageId: string, reactionId: string): Promise<void> {
+    try {
+      await this.internal.im.message.reaction.delete(messageId, reactionId)
+      this.logger.debug('thinking reaction removed messageId=%s reactionId=%s', messageId, reactionId)
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      this.logger.warn(
+        'failed to remove thinking reaction messageId=%s reactionId=%s detail=%s',
+        messageId, reactionId, detail,
+      )
+    }
   }
 
   async deleteMessage(channelId: string, messageId: string) {
@@ -454,6 +586,16 @@ export namespace LarkBot {
     profileFailureCacheTtl: number
     incomingImageMode: IncomingImageMode
     outgoingRichTextDebug: boolean
+    thinkingReaction: boolean
+    thinkingReactionEmoji: string
+    thinkingReactionRetireDelayMs: number
+    thinkingReactionTtlMs: number
+    messageEditRelay: boolean
+    messageEditThreshold: number
+    messageEditRedirectTtlMs: number
+    surfaceErrors: boolean
+    errorSurfaceDelayMs: number
+    errorMessageTemplate: string
   }
 
   export type Config = BaseConfig & (HttpServer.Options | WsClient.Options)
@@ -468,6 +610,16 @@ export namespace LarkBot {
       profileFailureCacheTtl: Schema.number().min(10).default(300).description('用户资料查询失败缓存时长，单位为秒。'),
       incomingImageMode: Schema.union(['internal', 'data-url']).default('internal').description('收到图片消息时输出的资源格式。`data-url` 可兼容不支持 `internal:` 协议的插件。'),
       outgoingRichTextDebug: Schema.boolean().default(false).description('输出富文本编码诊断日志，包含链接节点 children 和最终 post payload。仅建议排查渲染问题时临时开启。'),
+      thinkingReaction: Schema.boolean().default(true).description('收到用户消息时立即在其消息上添加飞书表情，作为「机器人正在思考」的可见反馈。'),
+      thinkingReactionEmoji: Schema.string().default('THINKING').description('用作思考中提示的飞书 emoji 类型（如 `THINKING`、`HOURGLASS`、`CLOCK`）。参考飞书官方 emoji 类型列表。'),
+      thinkingReactionRetireDelayMs: Schema.number().min(0).default(3000).description('机器人首次向该会话发送/编辑消息后，延迟多少毫秒撤销思考表情。`0` 表示立即撤销。'),
+      thinkingReactionTtlMs: Schema.number().min(1000).default(120000).description('思考表情的最长存活时长，用于兜底避免机器人未响应时表情永久残留。'),
+      messageEditRelay: Schema.boolean().default(true).description('启用编辑上限自动续接：当同一条消息的编辑次数达到本地阈值或触发飞书 230072 时，自动切换为新消息继续写入，让流式回复不中断。'),
+      messageEditThreshold: Schema.number().min(0).default(20).description('单条消息本地编辑次数阈值。达到后主动切换新消息，避免打到飞书上限。`0` 表示不做本地熔断，仅依赖飞书 230072 触发续接。'),
+      messageEditRedirectTtlMs: Schema.number().min(10000).default(600000).description('编辑重定向表的过期时间。过期后旧 messageId 的编辑请求不再自动重定向到续接后的新消息。'),
+      surfaceErrors: Schema.boolean().default(true).description('启用失败可见化：`sendMessage` / `editMessage` 抛出消息级错误时，向用户发送一条可读的失败提示。'),
+      errorSurfaceDelayMs: Schema.number().min(0).default(500).description('错误提示延迟发送时长（毫秒）。延迟窗口内若同会话有新的成功发送，则抑制错误提示，避免 ChatLuna 内部重试成功后仍显示错误。'),
+      errorMessageTemplate: Schema.string().default('[对话失败] Lark {code}: {msg}').description('失败提示消息模板，支持 `{code}` 和 `{msg}` 占位符。'),
       protocol: process.env.KOISHI_ENV === 'browser'
         ? Schema.const('ws').default('ws')
         : Schema.union(['http', 'ws']).description('选择要使用的协议。').default('http'),

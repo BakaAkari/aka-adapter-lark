@@ -87,6 +87,8 @@ export class HttpServer<C extends Context = Context> extends Adapter<C, LarkBot<
     const bot = this.bots.find((bot) => bot.config.appId === app_id)!
     const session = await adaptSession(bot, body)
     bot.logIncomingSession(session, body)
+    // A 能力：入站消息前置钩子（fire-and-forget，不阻塞 dispatch）
+    void bot.onInboundBeforeDispatch(body)
     bot.dispatch(session)
   }
 
