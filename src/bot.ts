@@ -235,6 +235,7 @@ export class LarkBot<C extends Context = Context, T extends LarkBot.Config = Lar
 
   /**
    * A 能力：入站消息前置钩子。给用户消息加"思考中"reaction。
+   * 仅私聊或群聊中被 @ 时触发，避免群聊中无关消息也贴表情。
    * 必须 fire-and-forget（不阻塞 dispatch）。由 ws.ts / http.ts 调用。
    */
   async onInboundBeforeDispatch(body: Utils.EventPayload): Promise<void> {
@@ -244,7 +245,37 @@ export class LarkBot<C extends Context = Context, T extends LarkBot.Config = Lar
     const event = body.event
     const messageId = event?.message?.message_id
     const chatId = event?.message?.chat_id
-    if (!messageId || !chatId) return
+    const chatType = event?.message?.chat_type
+    if (!messageId || !chatId || !chatType) return
+
+    // [diagnostic] 打印实际运行时值
+    const rawMentions = (event as any)?.message?.mentions
+    const selfId = this.selfId
+    this.logger.info('[thinking-reaction-diagnostic] chatType=%s selfId=%s mentions=%j',
+      chatType, selfId, rawMentions)
+
+    // 私聊：总是需要回复
+    // 群聊：仅当机器人被 @ 时才加 reaction
+    if (chatType === 'group') {
+      const mentions = event?.message?.mentions
+      if (!mentions || mentions.length === 0) {
+        this.logger.info('[thinking-reaction-diagnostic] group chat without mentions, skipping reaction')
+        return
+      }
+      const isBotMentioned = mentions.some((m) => {
+        const rawId = (m as any).id
+        if (typeof rawId === 'string') {
+          this.logger.info('[thinking-reaction-diagnostic] mention.id is string=%s selfId=%s match=%s',
+            rawId, selfId, rawId === selfId)
+          return rawId === selfId
+        }
+        this.logger.info('[thinking-reaction-diagnostic] mention.id is object=%j open_id=%s selfId=%s match=%s',
+          rawId, rawId?.open_id, selfId, rawId?.open_id === selfId)
+        return rawId?.open_id === selfId
+      })
+      this.logger.info('[thinking-reaction-diagnostic] isBotMentioned=%s', isBotMentioned)
+      if (!isBotMentioned) return
+    }
 
     // 避免给机器人自己发的消息加 reaction（虽然通常入站事件不会包含自己）
     const senderType = event?.sender?.sender_type
