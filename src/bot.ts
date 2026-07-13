@@ -1,4 +1,5 @@
-import { Bot, Context, h, HTTP, Schema, Session, Time, Universal } from '@satorijs/core'
+import { Bot, Context, h, HTTP, Session, Time, Universal } from '@satorijs/core'
+import { Schema } from 'koishi'
 import { Im, User as LarkUser } from './types'
 import { HttpServer } from './http'
 import { WsClient } from './ws'

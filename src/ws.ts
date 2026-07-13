@@ -1,4 +1,5 @@
-import { Adapter, Context, Schema, Universal } from '@satorijs/core'
+import { Adapter, Context, Universal } from '@satorijs/core'
+import { Schema } from 'koishi'
 import { LarkBot } from './bot'
 import { adaptSession, EventPayload } from './utils'
 import pb from 'protobufjs/light.js'
