@@ -50,6 +50,31 @@ function formatHydrationError(error: unknown) {
   return String(error)
 }
 
+/**
+ * internal 路由上游错误响应体摘要：解码为文本、脱敏、截断。
+ * 仅用于日志，不向后转发。
+ */
+function summarizeUpstreamBody(data: unknown, maxLength = 500): string {
+  let text: string
+  try {
+    if (typeof data === 'string') {
+      text = data
+    } else if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
+      text = Buffer.from(data as ArrayBuffer).toString('utf8')
+    } else {
+      text = JSON.stringify(data)
+    }
+  } catch {
+    return '[unreadable body]'
+  }
+  text = text
+    .replace(/Bearer\s+[A-Za-z0-9._~+\-/=]+/gi, 'Bearer [REDACTED]')
+    .replace(/(access_token|api[_-]?key|secret)["'\s:=]+[^&\s,"']+/gi, '$1=[REDACTED]')
+    .replace(/\s+/g, ' ')
+    .trim()
+  return text.length <= maxLength ? text : `${text.slice(0, maxLength)}…`
+}
+
 export class LarkBot<C extends Context = Context, T extends LarkBot.Config = LarkBot.Config> extends Bot<C, T> {
   static inject = ['http']
   static MessageEncoder = LarkMessageEncoder
@@ -114,6 +139,16 @@ export class LarkBot<C extends Context = Context, T extends LarkBot.Config = Lar
         responseType: 'arraybuffer',
         validateStatus: () => true,
       })
+      // 上游错误（如飞书资源下载 500/403）默认只透传状态码，下游排障拿不到真实原因。
+      // 这里把上游响应体片段（脱敏截断）写入日志，生产排障可直接定位。
+      if (response.status >= 400) {
+        this.logger.warn(
+          'internal route upstream error: status=%d path=%s body=%s',
+          response.status,
+          `/${params.path}`,
+          summarizeUpstreamBody(response.data),
+        )
+      }
       return {
         status: response.status,
         body: response.data,
